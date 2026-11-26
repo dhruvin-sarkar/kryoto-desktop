@@ -2500,6 +2500,9 @@ async fn fetch_source<R: Runtime>(
     client: &reqwest::Client,
 ) -> Result<Option<reqwest::Client>, (String, bool)> {
     let is_mirror = edit(app, id, |_| {}).is_some_and(|d| d.mirror.is_some());
+    // A mirror on a row that started on our own server (taken over, or handed
+    // on from one that was) is one nobody asked for: asked without its page.
+    let taken_over = edit(app, id, |_| {}).is_some_and(|d| d.tried_sources.iter().any(|t| t.eq_ignore_ascii_case(OWN_SOURCE)));
     let (mut client, mut connections) = (client.clone(), settings.connections);
     // Our own link: see `own_client`. The pass from an earlier run goes back in.
     let jar = Arc::new(reqwest::cookie::Jar::default());
@@ -2543,7 +2546,7 @@ async fn fetch_source<R: Runtime>(
     };
     if !already_complete {
         if is_mirror {
-            match mirror_client(app, id, flag, false, false, settings.connections).await {
+            match mirror_client(app, id, flag, false, taken_over, settings.connections).await {
                 Ok(v) => (client, connections) = v,
                 Err(_) if flag.load(Ordering::SeqCst) != RUN => return Ok(None),
                 Err(e) => return Err((e, true)),
@@ -3347,6 +3350,19 @@ fn next_source(order: &[String], failed: &str, has: &[&str], ours: bool, tried: 
     order[from..].iter().find(|o| open(o)).cloned().or_else(|| open(OWN_SOURCE).then(|| OWN_SOURCE.to_string()))
 }
 
+/// The mirrors a failed row may be handed on to, by host. A row whose mirror
+/// took over from our own server (`OWN_SOURCE` among the sources it tried) is
+/// one nobody asked for, and the player may be in a game: as in
+/// `take_over_from_mirror`, a host that opens its page for a check is left out.
+fn pages_to_hand_on(pages: Vec<String>, tried: &[String]) -> Vec<(String, String)> {
+    let unasked = tried.iter().any(|t| t.eq_ignore_ascii_case(OWN_SOURCE));
+    pages
+        .into_iter()
+        .filter(|p| !unasked || crate::resolvers::opens_no_page(p))
+        .filter_map(|p| crate::resolvers::classify(&p).map(|(_, h)| (h.to_string(), p)))
+        .collect()
+}
+
 /// What `hand_on` did with a failed row.
 enum HandOn {
     /// It is on its next source, to be fetched from there.
@@ -3383,10 +3399,7 @@ async fn hand_on<R: Runtime>(app: &AppHandle<R>, id: &str, flag: &AtomicU8, sett
     if stopped() {
         return HandOn::Stopped;
     }
-    let pages: Vec<(String, String)> = mirror_pages(&listing, d.release.as_deref())
-        .into_iter()
-        .filter_map(|p| crate::resolvers::classify(&p).map(|(_, h)| (h.to_string(), p)))
-        .collect();
+    let pages = pages_to_hand_on(mirror_pages(&listing, d.release.as_deref()), &d.tried_sources);
     let has: Vec<&str> = pages.iter().map(|(h, _)| h.as_str()).collect();
     let mut tried = d.tried_sources.clone();
     tried.push(failed.host.clone());
@@ -7760,6 +7773,21 @@ mod tests {
         // Everything tried: the failure stands.
         assert_eq!(next("VikingFile", &has, false, &["VikingFile"]), None);
         assert_eq!(next_source(&[], "Gofile", &has, true, &[]), None);
+    }
+
+    /// A mirror that took over from our own server and then failed is handed
+    /// on only to a host that opens no page: nobody asked for either, and a
+    /// check window would pop up over a game. A row on a mirror the player
+    /// picked may go on to any host.
+    #[test]
+    fn a_taken_over_mirror_is_never_handed_on_to_a_page_host() {
+        let pages = || ["https://1fichier.com/?abc", "https://pixeldrain.com/u/a", "https://gofile.io/d/c"].map(String::from).to_vec();
+        let hosts = |tried: &[&str]| {
+            let tried: Vec<String> = tried.iter().map(|t| t.to_string()).collect();
+            pages_to_hand_on(pages(), &tried).into_iter().map(|(h, _)| h).collect::<Vec<_>>()
+        };
+        assert_eq!(hosts(&["kryoto", "Gofile"]), ["Pixeldrain", "Gofile"]);
+        assert_eq!(hosts(&["Gofile"]), ["1fichier", "Pixeldrain", "Gofile"]);
     }
 
     /// Suggestion #110: when our own server keeps cutting a download, the
